@@ -1,0 +1,16 @@
+Accuracy: 0.5126
+Precision: 0.5151
+Recall: 0.5126
+F1-Score: 0.5133
+
+              precision    recall  f1-score   support
+
+        fall       0.63      0.59      0.61       190
+      normal       0.49      0.49      0.49       190
+     sitting       0.52      0.48      0.50       190
+    standing       0.50      0.55      0.53       190
+     walking       0.43      0.45      0.44       190
+
+    accuracy                           0.51       950
+   macro avg       0.52      0.51      0.51       950
+weighted avg       0.52      0.51      0.51       950
