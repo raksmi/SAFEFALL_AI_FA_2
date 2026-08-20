@@ -1,6 +1,6 @@
 streamlit
-tensorflow
-https://github.com/ultralytics/ultralytics/archive/refs/heads/main.zip
+tensorflow==2.19.1
+git+https://github.com/ultralytics/ultralytics.git
 opencv-python-headless
 numpy
 pandas
@@ -8,4 +8,3 @@ matplotlib
 seaborn
 scikit-learn
 pillow
-tqdm
