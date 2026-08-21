@@ -1,6 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 streamlit
-tensorflow==2.19.1
-git+https://github.com/ultralytics/ultralytics.git
+tensorflow-cpu
+torch
+torchvision
+https://github.com/ultralytics/ultralytics/archive/refs/heads/main.zip
 opencv-python-headless
 numpy
 pandas
@@ -8,4 +11,4 @@ matplotlib
 seaborn
 scikit-learn
 pillow
-opencv-python
+tqdm
