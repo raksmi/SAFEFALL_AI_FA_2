@@ -409,7 +409,7 @@ def process_and_show_image(frame):
     st.image(
         cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
         caption="Pose Estimation Output",
-        use_container_width=True,
+        width='stretch',
     )
 
     if label == FALL_CLASS:
@@ -467,7 +467,7 @@ with col_main:
                     frame_placeholder.image(
                         cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                         caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
-                        use_container_width=True,
+                        width='stretch',
                     )
                     with alert_placeholder.container():
                         if label == FALL_CLASS:
@@ -561,7 +561,7 @@ with col_stats:
         st.subheader("📝 Incident log")
         log_df = pd.DataFrame(history)
         log_df["confidence"] = (log_df["confidence"] * 100).round(1).astype(str) + "%"
-        st.dataframe(log_df.iloc[::-1], use_container_width=True, height=180)
+        st.dataframe(log_df.iloc[::-1], width='stretch', height=180)
 
         csv_bytes = pd.DataFrame(history).to_csv(index=False).encode("utf-8")
         st.download_button(
