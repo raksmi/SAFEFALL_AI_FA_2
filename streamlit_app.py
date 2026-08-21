@@ -27,15 +27,18 @@ Core dashboard features (per FA-2 Step 7 requirements):
 Extra features added on top:
   - Live webcam snapshot input (st.camera_input), not just file upload
   - Adjustable alert confidence threshold (fewer false alarms vs.
-    more sensitive detection — a real tradeoff caregivers would tune)
-  - Audible alert tone on a confirmed fall (generated locally, no
-    external audio file needed)
-  - Full-width flashing red emergency banner, not just a small toast
-  - Resident/caregiver profile fields — an alert "would notify" card
-    shows exactly what a real SMS/email integration would send
-    (clearly labeled as a demo — no message actually leaves the app)
+    more sensitive detection)
+  - Audible alert tone on a confirmed fall (generated locally)
+  - Full-width flashing red emergency banner
+  - Resident/caregiver profile fields feeding a "would notify" demo card
   - Timestamped incident log for the session, downloadable as CSV
   - "Time since last fall" live metric
+  - Color-coded activity theme used consistently across banner, metric
+    cards, bar chart, pie chart, and the timeline chart
+  - Activity-distribution pie chart + a confidence-over-time timeline
+  - Auto-generated plain-English session summary
+  - Defensive handling of legacy/stale session-state entries so an old
+    browser tab reconnecting after a redeploy can never crash the app
 """
 
 import streamlit as st
@@ -69,6 +72,20 @@ FALL_CLASS = "fall"
 VIDEO_FRAME_SKIP = 5   # classify every Nth frame of an uploaded video
 DEFAULT_ALERT_THRESHOLD = 0.60
 
+# Consistent color per activity, used everywhere in the UI.
+ACTIVITY_COLORS = {
+    "fall":     "#e63946",
+    "walking":  "#4895ef",
+    "sitting":  "#9d4edd",
+    "standing": "#f4a261",
+    "normal":   "#2a9d8f",
+}
+DEFAULT_COLOR = "#888888"
+
+
+def color_for(activity: str) -> str:
+    return ACTIVITY_COLORS.get(activity, DEFAULT_COLOR)
+
 
 def load_classes():
     """Load the exact class order train_model.py trained on. Falls back to
@@ -89,7 +106,7 @@ st.set_page_config(
 )
 
 # --------------------------------------------------------------------------
-# STYLING — flashing emergency banner
+# STYLING
 # --------------------------------------------------------------------------
 st.markdown(
     """
@@ -111,16 +128,45 @@ st.markdown(
         border: 2px solid #ffffff40;
     }
     .notify-card {
-        background-color: #1e1e1e;
-        border-left: 5px solid #d10000;
+        background: linear-gradient(135deg, #241010, #1a0d0d);
+        border-left: 5px solid #e63946;
         padding: 14px 18px;
         border-radius: 6px;
         margin-top: 10px;
+    }
+    .metric-card {
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+        color: white;
+    }
+    .metric-card .label { font-size: 0.8rem; opacity: 0.85; }
+    .metric-card .value { font-size: 1.6rem; font-weight: 700; }
+    .summary-card {
+        background: linear-gradient(135deg, #10231f, #0d1a17);
+        border-left: 5px solid #2a9d8f;
+        padding: 16px 20px;
+        border-radius: 8px;
+        line-height: 1.7;
+    }
+    h1 {
+        background: linear-gradient(90deg, #e63946, #4895ef, #2a9d8f);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def metric_card(label, value, color):
+    st.markdown(
+        f"""<div class="metric-card" style="background:{color}22;border:1px solid {color};">
+        <div class="label">{label}</div><div class="value" style="color:{color};">{value}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -162,8 +208,7 @@ def generate_beep_base64():
 
 def play_alert_sound():
     """Embed an autoplaying alert tone. Browsers may block autoplay until
-    the user has interacted with the page at least once — this is a
-    browser policy, not a bug in the app."""
+    the user has interacted with the page at least once."""
     b64 = generate_beep_base64()
     st.markdown(
         f"""<audio autoplay>
@@ -177,9 +222,20 @@ def play_alert_sound():
 # SESSION STATE
 # --------------------------------------------------------------------------
 if "history" not in st.session_state:
-    st.session_state.history = []   # list of dicts: timestamp, label, confidence
+    st.session_state.history = []   # list of dicts: timestamp, activity, confidence
 if "last_fall_time" not in st.session_state:
     st.session_state.last_fall_time = None
+
+
+def normalize_entry(h):
+    """Make analytics resilient to stale session state left over from an
+    older app version (e.g. a browser tab still open from before a
+    redeploy). Accepts either the current dict format or the legacy
+    (label, confidence) tuple format."""
+    if isinstance(h, dict):
+        return h
+    label, confidence = h
+    return {"timestamp": "-", "activity": label, "confidence": confidence}
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +312,40 @@ def show_fall_alert(confidence, threshold, resident_name, caregiver_name, caregi
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def build_session_summary(history):
+    """A deterministic, plain-English recap of the session — not a model
+    call, just arithmetic over what's already been logged."""
+    if not history:
+        return None
+
+    total = len(history)
+    counts = Counter(h["activity"] for h in history)
+    most_common_activity, most_common_n = counts.most_common(1)[0]
+    fall_count = counts.get(FALL_CLASS, 0)
+    fall_rate = fall_count / total
+
+    timestamps = [h["timestamp"] for h in history if h["timestamp"] != "-"]
+    duration_line = ""
+    if len(timestamps) >= 2:
+        try:
+            t0 = datetime.strptime(timestamps[0], "%Y-%m-%d %H:%M:%S")
+            t1 = datetime.strptime(timestamps[-1], "%Y-%m-%d %H:%M:%S")
+            span_min = max((t1 - t0).total_seconds() / 60, 0)
+            duration_line = f" over roughly {span_min:.1f} minute(s) of monitoring"
+        except ValueError:
+            pass
+
+    risk_word = "high" if fall_rate > 0.15 else ("moderate" if fall_rate > 0.03 else "low")
+
+    return (
+        f"**{total} predictions**{duration_line}. "
+        f"Most frequent activity: **{most_common_activity}** ({most_common_n} times, "
+        f"{most_common_n/total:.0%}). "
+        f"**{fall_count} fall(s)** detected — a {fall_rate:.1%} fall rate, "
+        f"which reads as **{risk_word} risk** for this session."
     )
 
 
@@ -398,39 +488,74 @@ with col_main:
 # ---- RIGHT: monitoring analytics ----
 with col_stats:
     st.subheader("📊 Monitoring Analytics")
-    history = st.session_state.history
+    history = [normalize_entry(h) for h in st.session_state.history]
 
     total = len(history)
     fall_count = sum(1 for h in history if h["activity"] == FALL_CLASS)
     normal_count = total - fall_count
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Total Activities", total)
-    m2.metric("Falls Detected", fall_count)
-    m3.metric("Normal Activity", normal_count)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        metric_card("Total Activities", total, "#4895ef")
+    with c2:
+        metric_card("Falls Detected", fall_count, ACTIVITY_COLORS[FALL_CLASS])
+    with c3:
+        metric_card("Normal Activity", normal_count, ACTIVITY_COLORS["normal"])
 
     if st.session_state.last_fall_time:
         elapsed = datetime.now() - st.session_state.last_fall_time
         mins = int(elapsed.total_seconds() // 60)
-        st.metric("⏱️ Time since last fall", f"{mins} min ago" if mins > 0 else "Just now")
+        metric_card("⏱️ Time since last fall", f"{mins} min ago" if mins > 0 else "Just now", "#f4a261")
     else:
-        st.metric("⏱️ Time since last fall", "No falls yet")
+        metric_card("⏱️ Time since last fall", "No falls yet", "#2a9d8f")
 
     if history:
         avg_conf = np.mean([h["confidence"] for h in history])
-        st.metric("Avg. Prediction Confidence", f"{avg_conf:.1%}")
+        metric_card("Avg. Prediction Confidence", f"{avg_conf:.1%}", "#9d4edd")
+
+        st.markdown("---")
+        st.markdown("**🧾 Session summary**")
+        st.markdown(f'<div class="summary-card">{build_session_summary(history)}</div>',
+                     unsafe_allow_html=True)
+        st.markdown("---")
 
         counts = Counter(h["activity"] for h in history)
         df_counts = pd.DataFrame({"Activity": list(counts.keys()), "Count": list(counts.values())})
+        bar_colors = [color_for(a) for a in df_counts["Activity"]]
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.bar(df_counts["Activity"], df_counts["Count"], color=[
-            "#e74c3c" if a == FALL_CLASS else "#3498db" for a in df_counts["Activity"]
-        ])
-        ax.set_title("Activity Distribution")
-        ax.set_ylabel("Count")
-        plt.xticks(rotation=30)
-        st.pyplot(fig)
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            fig, ax = plt.subplots(figsize=(4, 3.4))
+            ax.bar(df_counts["Activity"], df_counts["Count"], color=bar_colors)
+            ax.set_title("Activity Distribution")
+            ax.set_ylabel("Count")
+            plt.xticks(rotation=30)
+            st.pyplot(fig)
+
+        with chart_col2:
+            fig2, ax2 = plt.subplots(figsize=(4, 3.4))
+            ax2.pie(
+                df_counts["Count"], labels=df_counts["Activity"], colors=bar_colors,
+                autopct="%1.0f%%", startangle=90, textprops={"fontsize": 8},
+            )
+            ax2.set_title("Activity Share")
+            st.pyplot(fig2)
+
+        # Confidence-over-time timeline, colored per activity.
+        fig3, ax3 = plt.subplots(figsize=(8.4, 2.6))
+        indices = list(range(1, len(history) + 1))
+        confidences = [h["confidence"] for h in history]
+        point_colors = [color_for(h["activity"]) for h in history]
+        ax3.plot(indices, confidences, color="#555", linewidth=1, zorder=1)
+        ax3.scatter(indices, confidences, c=point_colors, s=28, zorder=2)
+        ax3.axhline(alert_threshold, color="#e63946", linestyle="--", linewidth=1,
+                     label=f"Alert threshold ({alert_threshold:.0%})")
+        ax3.set_ylim(0, 1.05)
+        ax3.set_xlabel("Prediction #")
+        ax3.set_ylabel("Confidence")
+        ax3.set_title("Confidence Timeline (color = predicted activity)")
+        ax3.legend(loc="lower right", fontsize=7)
+        st.pyplot(fig3)
 
         st.markdown("---")
         st.subheader("📝 Incident log")
