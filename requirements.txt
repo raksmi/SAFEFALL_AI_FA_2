@@ -12,3 +12,20 @@ seaborn
 scikit-learn
 pillow
 tqdm
+streamlit>=1.32
+numpy
+pandas
+plotly
+
+# IMPORTANT: use the headless build on Streamlit Community Cloud.
+# The regular `opencv-python` package needs system OpenGL/GUI libraries
+# (libGL.so.1 etc.) that the Cloud base image doesn't ship, and is a common
+# cause of the app crashing right after a video/image is processed.
+opencv-python-headless
+
+tensorflow-cpu
+
+# Installed straight from Ultralytics' GitHub source (not the PyPI name),
+# per the FA-2 Step 7 setup. Pin to a tag/commit if you want reproducible
+# builds instead of always pulling the tip of main.
+git+https://github.com/ultralytics/ultralytics.git
