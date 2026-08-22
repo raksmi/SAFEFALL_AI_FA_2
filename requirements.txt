@@ -3,7 +3,7 @@ streamlit
 tensorflow-cpu
 torch
 torchvision
-https://github.com/ultralytics/ultralytics/archive/refs/heads/main.zip
+https://github.com/ultralytics/ultralytics/archive/refs/tags/v8.4.19.zip
 numpy
 pandas
 plotly
