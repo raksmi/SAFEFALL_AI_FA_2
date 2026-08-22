@@ -49,6 +49,7 @@ import cv2
 import json
 import tempfile
 import os
+import subprocess
 import time
 import io
 import wave
@@ -226,6 +227,40 @@ def normalize_entry(h):
 # --------------------------------------------------------------------------
 # CORE INFERENCE
 # --------------------------------------------------------------------------
+def strip_audio_track(input_path: str) -> str:
+    """Remux the video WITHOUT its audio track using a real ffmpeg
+    subprocess (isolated from OpenCV's own internal decoder).
+
+    Some Le2i dataset .avi files carry a corrupted/malformed audio stream
+    that crashes FFmpeg's mp3 decoder the moment anything tries to probe
+    it (OpenCV's VideoCapture does this internally even though we never
+    read audio). Since the app never needs audio at all, the safest fix
+    is to remove it entirely before OpenCV ever opens the file — '-an'
+    drops audio, '-vcodec copy' re-muxes the video stream instantly with
+    no re-encoding (fast, lossless).
+
+    Returns the path to the audio-free file, or the original path
+    unchanged if ffmpeg isn't available or the strip step fails for any
+    reason (best-effort — better to try the original file than to block
+    the user entirely)."""
+    suffix = Path(input_path).suffix or ".mp4"
+    out_fd, out_path = tempfile.mkstemp(suffix=suffix)
+    os.close(out_fd)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, "-an", "-vcodec", "copy", out_path],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and os.path.getsize(out_path) > 0:
+            return out_path
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    # Fall back to the original file if stripping failed for any reason.
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    return input_path
+
+
 def run_pose_estimation(frame_bgr, pose_model):
     results = pose_model.predict(source=frame_bgr, verbose=False)
     result = results[0]
@@ -440,8 +475,11 @@ with tab_monitor:
             tfile.close()
             temp_path = tfile.name
 
+            with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
+                safe_path = strip_audio_track(temp_path)
+
             try:
-                cap = cv2.VideoCapture(temp_path)
+                cap = cv2.VideoCapture(safe_path)
                 if not cap.isOpened():
                     st.error(
                         "Could not open this video file. Try re-exporting it as a "
@@ -485,9 +523,10 @@ with tab_monitor:
                     cap.release()
                     st.success("Video processing complete.")
             finally:
-                # Clean up the temp file regardless of success/failure.
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                # Clean up both temp files regardless of success/failure.
+                for p in {temp_path, safe_path}:
+                    if os.path.exists(p):
+                        os.remove(p)
 
 # --------------------------------------------------------------------------
 # TAB 2: ANALYTICS
