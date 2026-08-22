@@ -43,6 +43,7 @@ Extra features on top:
     uploads; temp files are also cleaned up after use
 """
 
+import gc
 import streamlit as st
 import numpy as np
 import cv2
@@ -74,7 +75,14 @@ LABELS_PATH = "class_labels.json"
 YOLO_POSE_MODEL_NAME = "yolov8n-pose.pt"
 IMG_SIZE = (224, 224)
 FALL_CLASS = "fall"
-VIDEO_FRAME_SKIP = 5
+VIDEO_FRAME_SKIP = 15   # process fewer frames — Streamlit Cloud's free
+                         # tier has ~1GB RAM; TensorFlow + PyTorch/YOLO
+                         # loaded together already use a large share of
+                         # that before a single frame is processed, so
+                         # keeping per-video work light matters a lot.
+MAX_FRAMES_PER_VIDEO = 60   # hard cap so a long video can't run the
+                             # container out of memory over time
+MAX_FRAME_DIMENSION = 640   # downscale large frames before inference
 DEFAULT_ALERT_THRESHOLD = 0.60
 
 ACTIVITY_COLORS = {
@@ -261,8 +269,22 @@ def strip_audio_track(input_path: str) -> str:
     return input_path
 
 
+def downscale_if_large(frame_bgr, max_dim=MAX_FRAME_DIMENSION):
+    """Shrink oversized frames before they hit either model. Smaller
+    arrays mean less peak memory per frame — important on a ~1GB
+    container running two deep learning frameworks at once."""
+    h, w = frame_bgr.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return frame_bgr
+    scale = max_dim / longest
+    return cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))
+
+
 def run_pose_estimation(frame_bgr, pose_model):
-    results = pose_model.predict(source=frame_bgr, verbose=False)
+    # imgsz=480 (vs Ultralytics' 640 default) trims memory/compute per
+    # call — meaningful when running on a small, shared container.
+    results = pose_model.predict(source=frame_bgr, verbose=False, imgsz=480)
     result = results[0]
     annotated = result.plot()
     pose_found = result.boxes is not None and len(result.boxes) > 0
@@ -426,6 +448,7 @@ tab_monitor, tab_analytics, tab_log = st.tabs(["🎥 Live Monitor", "📊 Analyt
 
 
 def process_and_show_image(frame):
+    frame = downscale_if_large(frame)
     annotated, pose_found = run_pose_estimation(frame, pose_model)
     label, confidence = classify_frame(frame, classifier)
     record_prediction(label, confidence)
@@ -493,6 +516,7 @@ with tab_monitor:
 
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
                     frame_idx = 0
+                    processed_count = 0
 
                     while cap.isOpened():
                         ret, frame = cap.read()
@@ -501,9 +525,20 @@ with tab_monitor:
                         frame_idx += 1
 
                         if frame_idx % VIDEO_FRAME_SKIP == 0:
+                            if processed_count >= MAX_FRAMES_PER_VIDEO:
+                                st.info(
+                                    f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames "
+                                    f"to keep memory use safe on this server — the "
+                                    f"monitoring analytics below still reflect everything "
+                                    f"processed so far."
+                                )
+                                break
+
+                            frame = downscale_if_large(frame)
                             annotated, pose_found = run_pose_estimation(frame, pose_model)
                             label, confidence = classify_frame(frame, classifier)
                             record_prediction(label, confidence)
+                            processed_count += 1
 
                             frame_placeholder.image(
                                 cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
@@ -517,10 +552,22 @@ with tab_monitor:
                                 else:
                                     st.info(f"Monitoring... current activity: {label.capitalize()}")
 
+                            # Explicitly drop references and collect —
+                            # frames/annotated arrays are large, and letting
+                            # dozens of them pile up before Python's garbage
+                            # collector gets around to them is exactly the
+                            # kind of memory pressure that's been crashing
+                            # this app on Streamlit Cloud's small container.
+                            del annotated
+                            if processed_count % 10 == 0:
+                                gc.collect()
+
+                        del frame
                         progress.progress(min(frame_idx / total_frames, 1.0))
                         time.sleep(0.02)
 
                     cap.release()
+                    gc.collect()
                     st.success("Video processing complete.")
             finally:
                 # Clean up both temp files regardless of success/failure.
