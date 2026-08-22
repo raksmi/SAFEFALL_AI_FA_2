@@ -4,7 +4,6 @@ tensorflow-cpu
 torch
 torchvision
 https://github.com/ultralytics/ultralytics/archive/refs/heads/main.zip
-opencv-python-headless
 numpy
 pandas
 plotly
