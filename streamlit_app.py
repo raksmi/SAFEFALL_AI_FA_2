@@ -2,34 +2,84 @@
 CareVision HealthTech Pvt. Ltd. - SafeFall AI
 FA-2, Step 7: Model Deployment using Streamlit
 
-Pose estimation: YOLOv8 Pose (Ultralytics), installed directly from
-Ultralytics' GitHub source repository (see requirements.txt — an HTTPS
-archive URL, not a PyPI package name). Pose weights ('yolov8n-pose.pt')
-are auto-downloaded from Ultralytics' GitHub Releases on first run and
-cached locally.
+============================================================================
+STABILITY NOTES (read before touching video handling — hard-won lessons)
+============================================================================
+This app crashed repeatedly during development. Every one of the causes
+below is now handled. If video processing ever breaks again, check these
+first, in this order:
+
+  1. DUPLICATE OPENCV INSTALLS. Only ever depend on ONE of opencv-python /
+     opencv-python-headless. Ultralytics pulls in opencv-python itself —
+     do not also add opencv-python-headless to requirements.txt. Having
+     both installs two different native builds into the same site-packages
+     'cv2' folder and corrupts it.
+
+  2. CORRUPTED/UNUSUAL AUDIO TRACKS IN UPLOADED VIDEOS. Some source videos
+     (e.g. Le2i dataset .avi files) have malformed audio streams. OpenCV's
+     bundled FFmpeg probes ALL streams (audio included) even though this
+     app only ever reads video frames — and a malformed audio stream can
+     crash FFmpeg's decoder natively (uncatchable by Python try/except).
+     Fix: strip audio out via a real `ffmpeg` subprocess BEFORE OpenCV
+     ever opens the file (see strip_audio_track()). Requires `ffmpeg` in
+     packages.txt.
+
+  3. UNSTABLE ULTRALYTICS VERSION. requirements.txt must point at a tagged
+     GitHub RELEASE (e.g. .../archive/refs/tags/vX.Y.Z.zip), never
+     .../heads/main.zip. main is untested nightly code.
+
+  4. STALE/INCOMPATIBLE COMMITTED WEIGHTS. Do not commit yolov8n-pose.pt
+     to the repo. Ultralytics checks the working directory for a file
+     with that name BEFORE downloading — an old/mismatched local copy
+     silently shadows the correct auto-downloaded one and can crash on
+     load if it was saved by a different Ultralytics/PyTorch version.
+
+  5. MEMORY PRESSURE. Streamlit Community Cloud's free tier has ~1GB RAM.
+     TensorFlow + PyTorch/Ultralytics loaded together already use a large
+     share of that. Video mode must: sample sparsely (VIDEO_FRAME_SKIP),
+     cap total frames processed (MAX_FRAMES_PER_VIDEO), downscale large
+     frames (downscale_if_large), reject oversized uploads
+     (MAX_VIDEO_MB), and explicitly free per-frame arrays + gc.collect()
+     periodically. Under real memory pressure, native libraries can
+     corrupt their own heap before the OS kills the process — this shows
+     up as different-looking crashes each time, which is exactly what
+     happened here before these limits existed.
+
+  6. WRONG TEMP FILE EXTENSION. Always write an uploaded video to a temp
+     file using ITS OWN extension (Path(uploaded.name).suffix), never a
+     hardcoded one — a mismatched container/extension can make FFmpeg
+     misdetect the format.
+
+None of these are hypothetical — each one caused a real crash in this
+project before being fixed. Do not remove any of the mitigations below
+without a specific reason.
+============================================================================
+
+Pose estimation: YOLOv8 Pose (Ultralytics), installed directly from a
+tagged Ultralytics GitHub release (see requirements.txt). Pose weights
+('yolov8n-pose.pt') auto-download from Ultralytics' GitHub Releases on
+first run — do NOT commit this file to the repo (see note 4 above).
 
 Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
 
-Then deploy on Streamlit Cloud (https://streamlit.io) by pushing this repo
-(with fall_detection_model.h5, class_labels.json, requirements.txt,
-packages.txt) to GitHub and connecting it in Streamlit Cloud's "New app"
-flow.
+Deploy on Streamlit Cloud by pushing this repo (with
+fall_detection_model.h5, class_labels.json, requirements.txt,
+packages.txt — NOT yolov8n-pose.pt, NOT raw_dataset/, NOT
+processed_dataset/) to GitHub and connecting it via "New app".
 
-Core dashboard features (per FA-2 Step 7 requirements):
+Core dashboard features (FA-2 Step 7 requirements):
   - Upload an image OR a video
   - Runs YOLOv8 Pose estimation + the trained CNN activity classifier
   - Displays fall alerts, prediction confidence, and pose visualization
-  - Shows running monitoring analytics: total activities, fall count,
-    normal-activity count, and an activity distribution chart
+  - Shows running monitoring analytics
 
-Extra features on top:
-  - Tabbed dashboard (Live Monitor / Analytics / Incident Log) instead of
-    disconnected side-by-side panels, plus a hero status header
-  - Interactive Plotly charts (bar, donut, confidence timeline) instead
-    of static matplotlib
-  - Live webcam snapshot input (st.camera_input)
+Extra features:
+  - Tabbed dashboard (Live Monitor / Analytics / Incident Log) + hero
+    status header
+  - Interactive Plotly charts (bar, donut, confidence timeline)
+  - Live webcam snapshot input
   - Adjustable alert confidence threshold
   - Audible alert tone on a confirmed fall (generated locally)
   - Resident/caregiver profile fields feeding a "would notify" demo card
@@ -37,53 +87,46 @@ Extra features on top:
   - "Time since last fall" live metric
   - Auto-generated plain-English session summary
   - Defensive handling of legacy/stale session-state entries
-  - Uploaded videos are written to a temp file using their ORIGINAL
-    extension (not hardcoded to .mp4) — feeding FFmpeg a mismatched
-    container/extension is what was crashing the whole app on .avi
-    uploads; temp files are also cleaned up after use
 """
 
 import gc
-import streamlit as st
-import numpy as np
-import cv2
-import json
-import tempfile
-import os
-import subprocess
-import time
 import io
-import wave
+import os
 import base64
-from pathlib import Path
+import json
+import subprocess
+import tempfile
+import time
+import wave
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 
+import cv2
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-
+import streamlit as st
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from ultralytics import YOLO
 
-# --------------------------------------------------------------------------
+# ============================================================================
 # CONFIG
-# --------------------------------------------------------------------------
+# ============================================================================
 MODEL_PATH = "fall_detection_model.h5"
 LABELS_PATH = "class_labels.json"
 YOLO_POSE_MODEL_NAME = "yolov8n-pose.pt"
 IMG_SIZE = (224, 224)
 FALL_CLASS = "fall"
-VIDEO_FRAME_SKIP = 15   # process fewer frames — Streamlit Cloud's free
-                         # tier has ~1GB RAM; TensorFlow + PyTorch/YOLO
-                         # loaded together already use a large share of
-                         # that before a single frame is processed, so
-                         # keeping per-video work light matters a lot.
-MAX_FRAMES_PER_VIDEO = 60   # hard cap so a long video can't run the
-                             # container out of memory over time
-MAX_FRAME_DIMENSION = 640   # downscale large frames before inference
 DEFAULT_ALERT_THRESHOLD = 0.60
+
+# --- Resource limits (see stability note 5 above) ---
+VIDEO_FRAME_SKIP = 15          # only sample every Nth frame
+MAX_FRAMES_PER_VIDEO = 60      # hard cap regardless of video length
+MAX_FRAME_DIMENSION = 640      # downscale any frame larger than this
+POSE_INFERENCE_SIZE = 480      # YOLO internal inference resolution
+MAX_VIDEO_MB = 150             # reject uploads larger than this outright
 
 ACTIVITY_COLORS = {
     "fall":     "#e63946",
@@ -115,9 +158,9 @@ st.set_page_config(
     page_icon="🏥",
 )
 
-# --------------------------------------------------------------------------
+# ============================================================================
 # STYLING
-# --------------------------------------------------------------------------
+# ============================================================================
 st.markdown(
     """
     <style>
@@ -176,9 +219,9 @@ def metric_card(label, value, color):
     )
 
 
-# --------------------------------------------------------------------------
+# ============================================================================
 # CACHED RESOURCES
-# --------------------------------------------------------------------------
+# ============================================================================
 @st.cache_resource
 def load_classifier():
     return tf.keras.models.load_model(MODEL_PATH)
@@ -186,6 +229,8 @@ def load_classifier():
 
 @st.cache_resource
 def load_pose_model():
+    """See stability note 4: never let a locally-committed
+    yolov8n-pose.pt shadow this — always let it auto-download."""
     return YOLO(YOLO_POSE_MODEL_NAME)
 
 
@@ -214,9 +259,9 @@ def play_alert_sound():
     )
 
 
-# --------------------------------------------------------------------------
+# ============================================================================
 # SESSION STATE
-# --------------------------------------------------------------------------
+# ============================================================================
 if "history" not in st.session_state:
     st.session_state.history = []
 if "last_fall_time" not in st.session_state:
@@ -232,25 +277,14 @@ def normalize_entry(h):
     return {"timestamp": "-", "activity": label, "confidence": confidence}
 
 
-# --------------------------------------------------------------------------
-# CORE INFERENCE
-# --------------------------------------------------------------------------
+# ============================================================================
+# VIDEO SAFETY HELPERS
+# ============================================================================
 def strip_audio_track(input_path: str) -> str:
-    """Remux the video WITHOUT its audio track using a real ffmpeg
-    subprocess (isolated from OpenCV's own internal decoder).
-
-    Some Le2i dataset .avi files carry a corrupted/malformed audio stream
-    that crashes FFmpeg's mp3 decoder the moment anything tries to probe
-    it (OpenCV's VideoCapture does this internally even though we never
-    read audio). Since the app never needs audio at all, the safest fix
-    is to remove it entirely before OpenCV ever opens the file — '-an'
-    drops audio, '-vcodec copy' re-muxes the video stream instantly with
-    no re-encoding (fast, lossless).
-
-    Returns the path to the audio-free file, or the original path
-    unchanged if ffmpeg isn't available or the strip step fails for any
-    reason (best-effort — better to try the original file than to block
-    the user entirely)."""
+    """Remux the video WITHOUT its audio track via a real ffmpeg
+    subprocess, isolated from OpenCV's own internal decoder. See
+    stability note 2. Falls back to the original path if ffmpeg is
+    unavailable or the strip fails for any reason."""
     suffix = Path(input_path).suffix or ".mp4"
     out_fd, out_path = tempfile.mkstemp(suffix=suffix)
     os.close(out_fd)
@@ -263,16 +297,14 @@ def strip_audio_track(input_path: str) -> str:
             return out_path
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
-    # Fall back to the original file if stripping failed for any reason.
     if os.path.exists(out_path):
         os.remove(out_path)
     return input_path
 
 
 def downscale_if_large(frame_bgr, max_dim=MAX_FRAME_DIMENSION):
-    """Shrink oversized frames before they hit either model. Smaller
-    arrays mean less peak memory per frame — important on a ~1GB
-    container running two deep learning frameworks at once."""
+    """Shrink oversized frames before either model sees them — smaller
+    arrays mean less peak memory per frame (stability note 5)."""
     h, w = frame_bgr.shape[:2]
     longest = max(h, w)
     if longest <= max_dim:
@@ -281,18 +313,30 @@ def downscale_if_large(frame_bgr, max_dim=MAX_FRAME_DIMENSION):
     return cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))
 
 
+def cleanup_temp_files(*paths):
+    for p in set(paths):
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+# ============================================================================
+# CORE INFERENCE
+# ============================================================================
 def run_pose_estimation(frame_bgr, pose_model):
-    # imgsz=480 (vs Ultralytics' 640 default) trims memory/compute per
-    # call — meaningful when running on a small, shared container.
-    results = pose_model.predict(source=frame_bgr, verbose=False, imgsz=480)
+    results = pose_model.predict(source=frame_bgr, verbose=False, imgsz=POSE_INFERENCE_SIZE)
     result = results[0]
     annotated = result.plot()
     pose_found = result.boxes is not None and len(result.boxes) > 0
+    del results, result
     return annotated, pose_found
 
 
 def classify_frame(frame_bgr, model):
-    """Same preprocess_input as train_model.py so inference matches training."""
+    """Same preprocess_input as train_model.py so inference matches
+    training exactly (mismatched scaling silently tanks accuracy)."""
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, IMG_SIZE)
     img = img.astype("float32")
@@ -303,6 +347,7 @@ def classify_frame(frame_bgr, model):
     idx = int(np.argmax(preds))
     label = CLASSES[idx]
     confidence = float(preds[idx])
+    del img, preds
     return label, confidence
 
 
@@ -378,9 +423,9 @@ def build_session_summary(history):
     )
 
 
-# --------------------------------------------------------------------------
-# UI - SIDEBAR
-# --------------------------------------------------------------------------
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 st.sidebar.title("🏥 SafeFall AI")
 st.sidebar.markdown("**CareVision HealthTech Pvt. Ltd.**\n\nElderly Fall Detection Monitoring")
 
@@ -408,10 +453,9 @@ if st.sidebar.button("🔄 Reset monitoring session"):
     st.session_state.last_fall_time = None
     st.sidebar.success("Session analytics reset.")
 
-# --------------------------------------------------------------------------
+# ============================================================================
 # HERO HEADER
-# --------------------------------------------------------------------------
-history_preview = [normalize_entry(h) for h in st.session_state.history]
+# ============================================================================
 recent_fall = (
     st.session_state.last_fall_time is not None
     and (datetime.now() - st.session_state.last_fall_time).total_seconds() < 30
@@ -463,121 +507,143 @@ def process_and_show_image(frame):
     if not pose_found:
         st.warning("No body landmarks detected in this image — check lighting/angle.")
 
+    del annotated, frame
 
-# --------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
 # TAB 1: LIVE MONITOR
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 with tab_monitor:
     if not model_loaded:
         st.info("Dashboard preview only — connect a trained model to enable live predictions.")
+
     elif mode == "Upload Image":
         uploaded_img = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
         if uploaded_img is not None:
-            file_bytes = np.asarray(bytearray(uploaded_img.read()), dtype=np.uint8)
-            frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            process_and_show_image(frame)
+            try:
+                file_bytes = np.asarray(bytearray(uploaded_img.read()), dtype=np.uint8)
+                frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if frame is None:
+                    st.error("Couldn't read this image file — it may be corrupted. Try a different file.")
+                else:
+                    process_and_show_image(frame)
+            except Exception as e:
+                st.error(f"Something went wrong processing this image: {e}")
 
     elif mode == "Webcam Snapshot":
         st.caption("Take a live snapshot from your device camera — useful for a quick spot-check.")
         snapshot = st.camera_input("Camera")
         if snapshot is not None:
-            file_bytes = np.asarray(bytearray(snapshot.read()), dtype=np.uint8)
-            frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            process_and_show_image(frame)
+            try:
+                file_bytes = np.asarray(bytearray(snapshot.read()), dtype=np.uint8)
+                frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if frame is None:
+                    st.error("Couldn't read the camera snapshot. Try again.")
+                else:
+                    process_and_show_image(frame)
+            except Exception as e:
+                st.error(f"Something went wrong processing this snapshot: {e}")
 
     elif mode == "Upload Video":
         uploaded_vid = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
+
         if uploaded_vid is not None:
-            # IMPORTANT: use the ORIGINAL file extension, not a hardcoded one.
-            # Forcing e.g. .avi bytes into a ".mp4"-named temp file makes
-            # FFmpeg misjudge the container and can crash the whole process
-            # (not just raise a catchable Python exception).
-            original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
-            tfile.write(uploaded_vid.read())
-            tfile.close()
-            temp_path = tfile.name
+            size_mb = uploaded_vid.size / (1024 * 1024)
+            if size_mb > MAX_VIDEO_MB:
+                st.error(
+                    f"This video is {size_mb:.0f}MB — larger than the {MAX_VIDEO_MB}MB "
+                    f"limit for this server. Please upload a shorter clip or a lower-"
+                    f"resolution export."
+                )
+            else:
+                # Stability note 6: keep the ORIGINAL extension, never hardcode one.
+                original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
+                temp_path = None
+                safe_path = None
+                try:
+                    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
+                    tfile.write(uploaded_vid.read())
+                    tfile.close()
+                    temp_path = tfile.name
 
-            with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
-                safe_path = strip_audio_track(temp_path)
+                    with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
+                        safe_path = strip_audio_track(temp_path)
 
-            try:
-                cap = cv2.VideoCapture(safe_path)
-                if not cap.isOpened():
-                    st.error(
-                        "Could not open this video file. Try re-exporting it as a "
-                        "standard H.264 .mp4 — some older/unusual codecs aren't "
-                        "supported by the server's video backend."
-                    )
-                else:
-                    frame_placeholder = st.empty()
-                    alert_placeholder = st.empty()
-                    progress = st.progress(0)
+                    cap = cv2.VideoCapture(safe_path)
+                    if not cap.isOpened():
+                        st.error(
+                            "Could not open this video file. Try re-exporting it as a "
+                            "standard H.264 .mp4 — some older/unusual codecs aren't "
+                            "supported by the server's video backend."
+                        )
+                    else:
+                        frame_placeholder = st.empty()
+                        alert_placeholder = st.empty()
+                        progress = st.progress(0)
+                        stats_placeholder = st.empty()
 
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                    frame_idx = 0
-                    processed_count = 0
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+                        frame_idx = 0
+                        processed_count = 0
 
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        frame_idx += 1
-
-                        if frame_idx % VIDEO_FRAME_SKIP == 0:
-                            if processed_count >= MAX_FRAMES_PER_VIDEO:
-                                st.info(
-                                    f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames "
-                                    f"to keep memory use safe on this server — the "
-                                    f"monitoring analytics below still reflect everything "
-                                    f"processed so far."
-                                )
+                        while cap.isOpened():
+                            ret, frame = cap.read()
+                            if not ret:
                                 break
+                            frame_idx += 1
 
-                            frame = downscale_if_large(frame)
-                            annotated, pose_found = run_pose_estimation(frame, pose_model)
-                            label, confidence = classify_frame(frame, classifier)
-                            record_prediction(label, confidence)
-                            processed_count += 1
+                            if frame_idx % VIDEO_FRAME_SKIP == 0:
+                                if processed_count >= MAX_FRAMES_PER_VIDEO:
+                                    stats_placeholder.info(
+                                        f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled "
+                                        f"frames to keep memory use safe on this server — "
+                                        f"analytics below reflect everything processed so far."
+                                    )
+                                    break
 
-                            frame_placeholder.image(
-                                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                                caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
-                                width='stretch',
-                            )
-                            with alert_placeholder.container():
-                                if label == FALL_CLASS:
-                                    show_fall_alert(confidence, alert_threshold, resident_name,
-                                                     caregiver_name, caregiver_contact, room)
-                                else:
-                                    st.info(f"Monitoring... current activity: {label.capitalize()}")
+                                frame = downscale_if_large(frame)
+                                annotated, pose_found = run_pose_estimation(frame, pose_model)
+                                label, confidence = classify_frame(frame, classifier)
+                                record_prediction(label, confidence)
+                                processed_count += 1
 
-                            # Explicitly drop references and collect —
-                            # frames/annotated arrays are large, and letting
-                            # dozens of them pile up before Python's garbage
-                            # collector gets around to them is exactly the
-                            # kind of memory pressure that's been crashing
-                            # this app on Streamlit Cloud's small container.
-                            del annotated
-                            if processed_count % 10 == 0:
-                                gc.collect()
+                                frame_placeholder.image(
+                                    cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                                    caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
+                                    width='stretch',
+                                )
+                                with alert_placeholder.container():
+                                    if label == FALL_CLASS:
+                                        show_fall_alert(confidence, alert_threshold, resident_name,
+                                                         caregiver_name, caregiver_contact, room)
+                                    else:
+                                        st.info(f"Monitoring... current activity: {label.capitalize()}")
 
-                        del frame
-                        progress.progress(min(frame_idx / total_frames, 1.0))
-                        time.sleep(0.02)
+                                # Stability note 5: free large per-frame arrays promptly.
+                                del annotated
+                                if processed_count % 10 == 0:
+                                    gc.collect()
 
-                    cap.release()
-                    gc.collect()
-                    st.success("Video processing complete.")
-            finally:
-                # Clean up both temp files regardless of success/failure.
-                for p in {temp_path, safe_path}:
-                    if os.path.exists(p):
-                        os.remove(p)
+                            del frame
+                            progress.progress(min(frame_idx / total_frames, 1.0))
+                            time.sleep(0.02)
 
-# --------------------------------------------------------------------------
+                        cap.release()
+                        gc.collect()
+                        st.success(f"Video processing complete — {processed_count} frame(s) analyzed.")
+
+                except Exception as e:
+                    st.error(
+                        f"Something went wrong processing this video: {e}. "
+                        f"If this keeps happening with this specific file, try "
+                        f"re-exporting it as a standard H.264 .mp4."
+                    )
+                finally:
+                    cleanup_temp_files(temp_path, safe_path)
+
+# ----------------------------------------------------------------------
 # TAB 2: ANALYTICS
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 with tab_analytics:
     history = [normalize_entry(h) for h in st.session_state.history]
     total = len(history)
@@ -627,7 +693,6 @@ with tab_analytics:
             fig_pie.update_layout(height=340)
             st.plotly_chart(fig_pie, width='stretch')
 
-        # Interactive confidence timeline
         timeline_df = pd.DataFrame(history)
         timeline_df["index"] = range(1, len(timeline_df) + 1)
         fig_line = px.scatter(
@@ -656,9 +721,9 @@ with tab_analytics:
         "notifications above are a UI demo only — no SMS/email actually sends."
     )
 
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # TAB 3: INCIDENT LOG
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 with tab_log:
     history = [normalize_entry(h) for h in st.session_state.history]
     if history:
