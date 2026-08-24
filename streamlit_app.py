@@ -15,14 +15,14 @@ first, in this order:
      both installs two different native builds into the same site-packages
      'cv2' folder and corrupts it.
 
-  2. CORRUPTED/UNUSUAL AUDIO TRACKS IN UPLOADED VIDEOS. Some source videos
-     (e.g. Le2i dataset .avi files) have malformed audio streams. OpenCV's
-     bundled FFmpeg probes ALL streams (audio included) even though this
-     app only ever reads video frames — and a malformed audio stream can
-     crash FFmpeg's decoder natively (uncatchable by Python try/except).
-     Fix: strip audio out via a real `ffmpeg` subprocess BEFORE OpenCV
-     ever opens the file (see strip_audio_track()). Requires `ffmpeg` in
-     packages.txt.
+  2. UNALIGNED NUMPY ARRAYS INTO TENSORFLOW. TensorFlow's ops can hard-crash
+     natively with "Check failed: IsAligned()" when given a numpy array
+     whose memory layout (from a chain of cv2 operations — cvtColor,
+     resize, preprocess_input, expand_dims) isn't aligned the way its
+     Eigen-based kernels expect. This is a documented TensorFlow issue, not
+     a logic bug. Fix: np.ascontiguousarray() on the final array right
+     before model.predict() (see classify_frame()) forces a fresh, safely
+     aligned buffer every time.
 
   3. UNSTABLE ULTRALYTICS VERSION. requirements.txt must point at a tagged
      GitHub RELEASE (e.g. .../archive/refs/tags/vX.Y.Z.zip), never
@@ -94,7 +94,6 @@ import io
 import os
 import base64
 import json
-import subprocess
 import tempfile
 import time
 import wave
@@ -280,28 +279,6 @@ def normalize_entry(h):
 # ============================================================================
 # VIDEO SAFETY HELPERS
 # ============================================================================
-def strip_audio_track(input_path: str) -> str:
-    """Remux the video WITHOUT its audio track via a real ffmpeg
-    subprocess, isolated from OpenCV's own internal decoder. See
-    stability note 2. Falls back to the original path if ffmpeg is
-    unavailable or the strip fails for any reason."""
-    suffix = Path(input_path).suffix or ".mp4"
-    out_fd, out_path = tempfile.mkstemp(suffix=suffix)
-    os.close(out_fd)
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-an", "-vcodec", "copy", out_path],
-            capture_output=True, timeout=120,
-        )
-        if result.returncode == 0 and os.path.getsize(out_path) > 0:
-            return out_path
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    return input_path
-
-
 def downscale_if_large(frame_bgr, max_dim=MAX_FRAME_DIMENSION):
     """Shrink oversized frames before either model sees them — smaller
     arrays mean less peak memory per frame (stability note 5)."""
@@ -342,6 +319,12 @@ def classify_frame(frame_bgr, model):
     img = img.astype("float32")
     img = preprocess_input(img)
     img = np.expand_dims(img, axis=0)
+    # Force a clean, contiguous, aligned copy. Arrays coming out of a
+    # chain of cv2 operations can end up with a memory layout TensorFlow's
+    # ops reject outright with "Check failed: IsAligned()" — a documented
+    # TF issue, not a bug in this pipeline's logic. np.ascontiguousarray
+    # guarantees a fresh, properly-aligned buffer every time.
+    img = np.ascontiguousarray(img)
 
     preds = model.predict(img, verbose=0)[0]
     idx = int(np.argmax(preds))
@@ -578,17 +561,13 @@ with tab_monitor:
                     # Stability note 6: keep the ORIGINAL extension, never hardcode one.
                     original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
                     temp_path = None
-                    safe_path = None
                     try:
                         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
                         tfile.write(uploaded_vid.read())
                         tfile.close()
                         temp_path = tfile.name
 
-                        with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
-                            safe_path = strip_audio_track(temp_path)
-
-                        cap = cv2.VideoCapture(safe_path)
+                        cap = cv2.VideoCapture(temp_path)
                         if not cap.isOpened():
                             st.error(
                                 "Could not open this video file. Try re-exporting it as a "
@@ -658,7 +637,7 @@ with tab_monitor:
                             f"re-exporting it as a standard H.264 .mp4."
                         )
                     finally:
-                        cleanup_temp_files(temp_path, safe_path)
+                        cleanup_temp_files(temp_path)
 
 # ----------------------------------------------------------------------
 # TAB 2: ANALYTICS
