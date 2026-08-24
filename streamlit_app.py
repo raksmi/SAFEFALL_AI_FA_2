@@ -102,6 +102,22 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+# --- Thread-pool isolation, set BEFORE importing TensorFlow/PyTorch -------
+# This process loads both TensorFlow and PyTorch (via Ultralytics/YOLO).
+# Both bundle their own OpenMP/Eigen threading runtimes, and running two
+# multi-threaded native runtimes in one process is a documented source of
+# heap corruption crashes ("free(): corrupted", "corrupted double-linked
+# list", "smallbin corrupted") that show up at different, seemingly
+# unrelated points — which matches everything seen in this app so far.
+# Forcing everything to single-threaded avoids the thread-pool collision
+# entirely. These env vars must be set before tensorflow/torch import.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
 import cv2
 import numpy as np
 import pandas as pd
@@ -110,6 +126,17 @@ import streamlit as st
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from ultralytics import YOLO
+import torch
+
+cv2.setNumThreads(1)
+torch.set_num_threads(1)
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    # TF only allows this before any op has run — if something already
+    # touched TF (shouldn't happen this early), skip rather than crash.
+    pass
 
 # ============================================================================
 # CONFIG
