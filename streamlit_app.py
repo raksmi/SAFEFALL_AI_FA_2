@@ -556,90 +556,109 @@ with tab_monitor:
                     f"resolution export."
                 )
             else:
-                # Stability note 6: keep the ORIGINAL extension, never hardcode one.
-                original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
-                temp_path = None
-                safe_path = None
-                try:
-                    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
-                    tfile.write(uploaded_vid.read())
-                    tfile.close()
-                    temp_path = tfile.name
+                sample_every = st.slider(
+                    "Analyse every Nth frame", min_value=5, max_value=30,
+                    value=VIDEO_FRAME_SKIP, step=5,
+                    help="Higher = fewer frames analyzed = faster and lighter on memory, "
+                         "but you might miss a brief fall between samples.",
+                )
+                run_btn = st.button("▶️ Run analysis", type="primary")
 
-                    with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
-                        safe_path = strip_audio_track(temp_path)
+                # IMPORTANT: gated behind a button, not automatic on upload.
+                # Streamlit reruns the ENTIRE script on any widget interaction
+                # anywhere in the app — without this button, moving the alert
+                # threshold slider (or any other widget) would silently
+                # re-process the whole video from scratch every single time,
+                # piling extra memory/compute pressure on top of whatever
+                # else is running. Processing only on an explicit click is
+                # both the expected UX and meaningfully safer here.
+                if not run_btn:
+                    st.caption("Video loaded — click **Run analysis** to process it.")
+                else:
+                    # Stability note 6: keep the ORIGINAL extension, never hardcode one.
+                    original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
+                    temp_path = None
+                    safe_path = None
+                    try:
+                        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
+                        tfile.write(uploaded_vid.read())
+                        tfile.close()
+                        temp_path = tfile.name
 
-                    cap = cv2.VideoCapture(safe_path)
-                    if not cap.isOpened():
-                        st.error(
-                            "Could not open this video file. Try re-exporting it as a "
-                            "standard H.264 .mp4 — some older/unusual codecs aren't "
-                            "supported by the server's video backend."
-                        )
-                    else:
-                        frame_placeholder = st.empty()
-                        alert_placeholder = st.empty()
-                        progress = st.progress(0)
-                        stats_placeholder = st.empty()
+                        with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
+                            safe_path = strip_audio_track(temp_path)
 
-                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                        frame_idx = 0
-                        processed_count = 0
+                        cap = cv2.VideoCapture(safe_path)
+                        if not cap.isOpened():
+                            st.error(
+                                "Could not open this video file. Try re-exporting it as a "
+                                "standard H.264 .mp4 — some older/unusual codecs aren't "
+                                "supported by the server's video backend."
+                            )
+                        else:
+                            frame_placeholder = st.empty()
+                            alert_placeholder = st.empty()
+                            progress = st.progress(0)
+                            stats_placeholder = st.empty()
 
-                        while cap.isOpened():
-                            ret, frame = cap.read()
-                            if not ret:
-                                break
-                            frame_idx += 1
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+                            frame_idx = 0
+                            processed_count = 0
 
-                            if frame_idx % VIDEO_FRAME_SKIP == 0:
-                                if processed_count >= MAX_FRAMES_PER_VIDEO:
-                                    stats_placeholder.info(
-                                        f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled "
-                                        f"frames to keep memory use safe on this server — "
-                                        f"analytics below reflect everything processed so far."
-                                    )
+                            while cap.isOpened():
+                                ret, frame = cap.read()
+                                if not ret:
                                     break
+                                frame_idx += 1
 
-                                frame = downscale_if_large(frame)
-                                annotated, pose_found = run_pose_estimation(frame, pose_model)
-                                label, confidence = classify_frame(frame, classifier)
-                                record_prediction(label, confidence)
-                                processed_count += 1
+                                if frame_idx % sample_every == 0:
+                                    if processed_count >= MAX_FRAMES_PER_VIDEO:
+                                        stats_placeholder.info(
+                                            f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled "
+                                            f"frames to keep memory use safe on this server — "
+                                            f"analytics below reflect everything processed so far."
+                                        )
+                                        break
 
-                                frame_placeholder.image(
-                                    cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                                    caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
-                                    width='stretch',
-                                )
-                                with alert_placeholder.container():
-                                    if label == FALL_CLASS:
-                                        show_fall_alert(confidence, alert_threshold, resident_name,
-                                                         caregiver_name, caregiver_contact, room)
-                                    else:
-                                        st.info(f"Monitoring... current activity: {label.capitalize()}")
+                                    frame = downscale_if_large(frame)
+                                    annotated, pose_found = run_pose_estimation(frame, pose_model)
+                                    label, confidence = classify_frame(frame, classifier)
+                                    record_prediction(label, confidence)
+                                    processed_count += 1
 
-                                # Stability note 5: free large per-frame arrays promptly.
-                                del annotated
-                                if processed_count % 10 == 0:
-                                    gc.collect()
+                                    frame_placeholder.image(
+                                        cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                                        caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
+                                        width='stretch',
+                                    )
+                                    with alert_placeholder.container():
+                                        if label == FALL_CLASS:
+                                            show_fall_alert(confidence, alert_threshold, resident_name,
+                                                             caregiver_name, caregiver_contact, room)
+                                        else:
+                                            st.info(f"Monitoring... current activity: {label.capitalize()}")
 
-                            del frame
-                            progress.progress(min(frame_idx / total_frames, 1.0))
-                            time.sleep(0.02)
+                                    # Stability note 5: free large per-frame arrays promptly.
+                                    del annotated
+                                    if processed_count % 10 == 0:
+                                        gc.collect()
 
-                        cap.release()
-                        gc.collect()
-                        st.success(f"Video processing complete — {processed_count} frame(s) analyzed.")
+                                del frame
+                                progress.progress(min(frame_idx / total_frames, 1.0))
+                                time.sleep(0.02)
 
-                except Exception as e:
-                    st.error(
-                        f"Something went wrong processing this video: {e}. "
-                        f"If this keeps happening with this specific file, try "
-                        f"re-exporting it as a standard H.264 .mp4."
-                    )
-                finally:
-                    cleanup_temp_files(temp_path, safe_path)
+                            cap.release()
+                            gc.collect()
+                            st.success(f"Video processing complete — {processed_count} frame(s) analyzed.")
+
+                    except Exception as e:
+                        st.error(
+                            f"Something went wrong processing this video: {e}. "
+                            f"If this keeps happening with this specific file, try "
+                            f"re-exporting it as a standard H.264 .mp4."
+                        )
+                    finally:
+                        cleanup_temp_files(temp_path, safe_path)
 
 # ----------------------------------------------------------------------
 # TAB 2: ANALYTICS
