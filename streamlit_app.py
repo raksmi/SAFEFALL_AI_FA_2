@@ -97,6 +97,7 @@ import json
 import subprocess
 import tempfile
 import time
+import math
 import wave
 from collections import Counter
 from datetime import datetime
@@ -648,10 +649,28 @@ with tab_monitor:
                         # imageio-ffmpeg decodes through an isolated FFmpeg process rather
                         # than OpenCV VideoCapture, while YOLO still handles pose detection.
                         metadata = iio.immeta(temp_path, plugin="FFMPEG")
-                        fps = float(metadata.get("fps", 0) or 0)
-                        nframes = int(metadata.get("nframes", 0) or 0)
-                        if fps <= 0:
+
+                        # Some FFmpeg/imageio video files report an unknown frame
+                        # count as infinity. Never convert infinity to int.
+                        raw_fps = metadata.get("fps", 0)
+                        raw_nframes = metadata.get("nframes", 0)
+
+                        try:
+                            fps = float(raw_fps)
+                            if not math.isfinite(fps) or fps <= 0:
+                                fps = 30.0
+                        except (TypeError, ValueError, OverflowError):
                             fps = 30.0
+
+                        try:
+                            nframes_float = float(raw_nframes)
+                            nframes = (
+                                int(nframes_float)
+                                if math.isfinite(nframes_float) and nframes_float > 0
+                                else 0
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            nframes = 0
 
                         frame_idx = 0
                         processed_count = 0
