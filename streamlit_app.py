@@ -150,7 +150,7 @@ DEFAULT_ALERT_THRESHOLD = 0.60
 
 # --- Resource limits (see stability note 5 above) ---
 VIDEO_FRAME_SKIP = 15          # only sample every Nth frame
-MAX_FRAMES_PER_VIDEO = 20      # safer hard cap for Streamlit Cloud memory
+MAX_FRAMES_PER_VIDEO = 30      # cap video inference work for Streamlit Cloud
 MAX_FRAME_DIMENSION = 640      # downscale any frame larger than this
 POSE_INFERENCE_SIZE = 480      # YOLO internal inference resolution
 MAX_VIDEO_MB = 150             # reject uploads larger than this outright
@@ -643,32 +643,30 @@ with tab_monitor:
                             frame_idx = 0
                             processed_count = 0
 
-                            # Process only a small number of sampled frames. This keeps
-                            # TensorFlow + PyTorch/YOLO memory usage manageable on Streamlit Cloud.
+                            # Video mode deliberately uses ONLY the TensorFlow fall classifier.
+                            # YOLO/PyTorch pose inference is kept for single images, where it is stable.
+                            # This avoids repeatedly mixing two native ML runtimes inside one long video loop.
                             while cap.isOpened() and processed_count < MAX_FRAMES_PER_VIDEO:
                                 ret, frame = cap.read()
                                 if not ret:
                                     break
 
                                 frame_idx += 1
-
-                                # Skip frames without sending them to either ML model.
                                 if frame_idx % sample_every != 0:
                                     del frame
                                     progress.progress(min(frame_idx / total_frames, 1.0))
                                     continue
 
-                                # Resize before inference to reduce peak memory.
+                                # Keep the CNN input lightweight.
                                 frame = downscale_if_large(frame)
 
-                                # Run both models on the sampled frame.
-                                annotated, pose_found = run_pose_estimation(frame, pose_model)
+                                # IMPORTANT: no YOLO pose estimation for video frames.
                                 label, confidence = classify_frame(frame, classifier)
                                 record_prediction(label, confidence)
                                 processed_count += 1
 
-                                # Convert once and explicitly keep/release the display buffer.
-                                frame_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                                # Display the actual sampled frame with the prediction.
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                 frame_placeholder.image(
                                     frame_rgb,
                                     caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
@@ -678,22 +676,14 @@ with tab_monitor:
                                 with alert_placeholder.container():
                                     if label == FALL_CLASS:
                                         show_fall_alert(
-                                            confidence,
-                                            alert_threshold,
-                                            resident_name,
-                                            caregiver_name,
-                                            caregiver_contact,
-                                            room,
+                                            confidence, alert_threshold, resident_name,
+                                            caregiver_name, caregiver_contact, room,
                                         )
                                     else:
-                                        st.info(
-                                            f"Monitoring... current activity: "
-                                            f"{label.capitalize()}"
-                                        )
+                                        st.info(f"Monitoring... current activity: {label.capitalize()}")
 
-                                # Release all large arrays before processing the next frame.
+                                # Explicitly release frame buffers before the next iteration.
                                 del frame_rgb
-                                del annotated
                                 del frame
                                 gc.collect()
 
