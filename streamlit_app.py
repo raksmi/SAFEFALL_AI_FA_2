@@ -119,24 +119,16 @@ os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import cv2
+import imageio.v3 as iio
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import tensorflow as tf
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from ultralytics import YOLO
 import torch
 
 cv2.setNumThreads(1)
 torch.set_num_threads(1)
-try:
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-except RuntimeError:
-    # TF only allows this before any op has run — if something already
-    # touched TF (shouldn't happen this early), skip rather than crash.
-    pass
 
 # ============================================================================
 # CONFIG
@@ -150,7 +142,7 @@ DEFAULT_ALERT_THRESHOLD = 0.60
 
 # --- Resource limits (see stability note 5 above) ---
 VIDEO_FRAME_SKIP = 15          # only sample every Nth frame
-MAX_FRAMES_PER_VIDEO = 30      # cap video inference work for Streamlit Cloud
+MAX_FRAMES_PER_VIDEO = 20      # safer hard cap for Streamlit Cloud memory
 MAX_FRAME_DIMENSION = 640      # downscale any frame larger than this
 POSE_INFERENCE_SIZE = 480      # YOLO internal inference resolution
 MAX_VIDEO_MB = 150             # reject uploads larger than this outright
@@ -251,6 +243,10 @@ def metric_card(label, value, color):
 # ============================================================================
 @st.cache_resource
 def load_classifier():
+    # TensorFlow is imported lazily so Video mode can run YOLO without
+    # loading TensorFlow into the same process. This avoids the native
+    # TensorFlow/PyTorch runtime collision seen on Streamlit Cloud.
+    import tensorflow as tf
     return tf.keras.models.load_model(MODEL_PATH)
 
 
@@ -367,26 +363,55 @@ def run_pose_estimation(frame_bgr, pose_model):
 
 
 def classify_frame(frame_bgr, model):
-    """Same preprocess_input as train_model.py so inference matches
-    training exactly (mismatched scaling silently tanks accuracy)."""
+    """CNN classification used for still images/webcam only.
+    TensorFlow and its MobileNet preprocessing are imported lazily."""
+    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, IMG_SIZE)
-    img = img.astype("float32")
-    img = preprocess_input(img)
-    img = np.expand_dims(img, axis=0)
-    # Force a clean, contiguous, aligned copy. Arrays coming out of a
-    # chain of cv2 operations can end up with a memory layout TensorFlow's
-    # ops reject outright with "Check failed: IsAligned()" — a documented
-    # TF issue, not a bug in this pipeline's logic. np.ascontiguousarray
-    # guarantees a fresh, properly-aligned buffer every time.
-    img = np.ascontiguousarray(img)
-
+    img = preprocess_input(img.astype("float32"))
+    img = np.ascontiguousarray(np.expand_dims(img, axis=0))
     preds = model.predict(img, verbose=0)[0]
     idx = int(np.argmax(preds))
     label = CLASSES[idx]
     confidence = float(preds[idx])
     del img, preds
     return label, confidence
+
+
+def pose_based_fall_detection(frame_bgr, pose_model):
+    """YOLO-only fall screening for video frames.
+
+    A fall is screened from the detected person's orientation: a strongly
+    horizontal bounding box is treated as a likely fall. This keeps video
+    inference entirely inside Ultralytics/YOLO and avoids loading TensorFlow
+    during video analysis on Streamlit Cloud.
+    """
+    results = pose_model.predict(source=frame_bgr, verbose=False, imgsz=POSE_INFERENCE_SIZE)
+    result = results[0]
+    annotated = result.plot()
+
+    if result.boxes is None or len(result.boxes) == 0:
+        return annotated, "normal", 0.0, False
+
+    boxes = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
+    ratios = []
+    for x1, y1, x2, y2 in boxes:
+        w = max(float(x2 - x1), 1.0)
+        h = max(float(y2 - y1), 1.0)
+        ratios.append(w / h)
+
+    # Use the most horizontal detected person. Ratio > 1.0 indicates a
+    # horizontal body; confidence increases smoothly with horizontality.
+    max_ratio = max(ratios)
+    det_conf = float(np.max(confs))
+    fall_score = min(0.99, max(0.0, (max_ratio - 0.75) / 0.75)) * det_conf
+    is_fall = max_ratio >= 1.05 and fall_score >= 0.25
+    label = FALL_CLASS if is_fall else "normal"
+    confidence = float(fall_score if is_fall else max(0.0, 1.0 - fall_score))
+
+    del results, result, boxes, confs, ratios
+    return annotated, label, confidence, True
 
 
 def record_prediction(label, confidence):
@@ -515,16 +540,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Load models lazily based on the selected input mode. Video mode deliberately
+# loads YOLO only; image/webcam mode uses the trained TensorFlow classifier.
+model_loaded = True
+classifier = None
+pose_model = None
 try:
-    classifier = load_classifier()
     pose_model = load_pose_model()
-    model_loaded = True
+    if mode != "Upload Video":
+        classifier = load_classifier()
 except Exception as e:
     model_loaded = False
-    st.error(
-        f"Could not load '{MODEL_PATH}'. Train the model first with train_model.py "
-        f"and place the .h5 file next to this app. ({e})"
-    )
+    st.error(f"Could not load the required model(s): {e}")
 
 tab_monitor, tab_analytics, tab_log = st.tabs(["🎥 Live Monitor", "📊 Analytics & Insights", "📝 Incident Log"])
 
@@ -589,126 +616,108 @@ with tab_monitor:
             size_mb = uploaded_vid.size / (1024 * 1024)
             if size_mb > MAX_VIDEO_MB:
                 st.error(
-                    f"This video is {size_mb:.0f}MB — larger than the {MAX_VIDEO_MB}MB "
-                    f"limit for this server. Please upload a shorter clip or a lower-"
-                    f"resolution export."
+                    f"This video is {size_mb:.0f}MB — larger than the {MAX_VIDEO_MB}MB limit. "
+                    "Please upload a shorter or lower-resolution clip."
                 )
             else:
                 sample_every = st.slider(
                     "Analyse every Nth frame", min_value=5, max_value=30,
                     value=VIDEO_FRAME_SKIP, step=5,
-                    help="Higher = fewer frames analyzed = faster and lighter on memory, "
-                         "but you might miss a brief fall between samples.",
+                    help="Higher = fewer frames analysed and lower server load.",
                 )
+                st.caption("Video mode uses YOLOv8 Pose directly for fall screening. "
+                           "TensorFlow is intentionally not loaded during video analysis for stability.")
                 run_btn = st.button("▶️ Run analysis", type="primary")
 
-                # IMPORTANT: gated behind a button, not automatic on upload.
-                # Streamlit reruns the ENTIRE script on any widget interaction
-                # anywhere in the app — without this button, moving the alert
-                # threshold slider (or any other widget) would silently
-                # re-process the whole video from scratch every single time,
-                # piling extra memory/compute pressure on top of whatever
-                # else is running. Processing only on an explicit click is
-                # both the expected UX and meaningfully safer here.
                 if not run_btn:
                     st.caption("Video loaded — click **Run analysis** to process it.")
                 else:
-                    # Stability note 6: keep the ORIGINAL extension, never hardcode one.
                     original_suffix = Path(uploaded_vid.name).suffix.lower() or ".mp4"
                     temp_path = None
-                    safe_path = None
                     try:
                         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix)
                         tfile.write(uploaded_vid.read())
                         tfile.close()
                         temp_path = tfile.name
 
-                        with st.spinner("Preparing video (stripping audio track for safe decoding)..."):
-                            safe_path = strip_audio_track(temp_path)
+                        frame_placeholder = st.empty()
+                        alert_placeholder = st.empty()
+                        progress = st.progress(0)
+                        stats_placeholder = st.empty()
 
-                        cap = cv2.VideoCapture(safe_path)
-                        if not cap.isOpened():
-                            st.error(
-                                "Could not open this video file. Try re-exporting it as a "
-                                "standard H.264 .mp4 — some older/unusual codecs aren't "
-                                "supported by the server's video backend."
-                            )
-                        else:
-                            frame_placeholder = st.empty()
-                            alert_placeholder = st.empty()
-                            progress = st.progress(0)
-                            stats_placeholder = st.empty()
+                        # imageio-ffmpeg decodes through an isolated FFmpeg process rather
+                        # than OpenCV VideoCapture, while YOLO still handles pose detection.
+                        metadata = iio.immeta(temp_path, plugin="FFMPEG")
+                        fps = float(metadata.get("fps", 0) or 0)
+                        nframes = int(metadata.get("nframes", 0) or 0)
+                        if fps <= 0:
+                            fps = 30.0
 
-                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                            frame_idx = 0
-                            processed_count = 0
+                        frame_idx = 0
+                        processed_count = 0
+                        frame_iter = iio.imiter(temp_path, plugin="FFMPEG")
 
-                            # Video mode deliberately uses ONLY the TensorFlow fall classifier.
-                            # YOLO/PyTorch pose inference is kept for single images, where it is stable.
-                            # This avoids repeatedly mixing two native ML runtimes inside one long video loop.
-                            while cap.isOpened() and processed_count < MAX_FRAMES_PER_VIDEO:
-                                ret, frame = cap.read()
-                                if not ret:
-                                    break
-
-                                frame_idx += 1
-                                if frame_idx % sample_every != 0:
-                                    del frame
-                                    progress.progress(min(frame_idx / total_frames, 1.0))
-                                    continue
-
-                                # Keep the CNN input lightweight.
-                                frame = downscale_if_large(frame)
-
-                                # IMPORTANT: no YOLO pose estimation for video frames.
-                                label, confidence = classify_frame(frame, classifier)
-                                record_prediction(label, confidence)
-                                processed_count += 1
-
-                                # Display the actual sampled frame with the prediction.
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                frame_placeholder.image(
-                                    frame_rgb,
-                                    caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
-                                    width="stretch",
-                                )
-
-                                with alert_placeholder.container():
-                                    if label == FALL_CLASS:
-                                        show_fall_alert(
-                                            confidence, alert_threshold, resident_name,
-                                            caregiver_name, caregiver_contact, room,
-                                        )
-                                    else:
-                                        st.info(f"Monitoring... current activity: {label.capitalize()}")
-
-                                # Explicitly release frame buffers before the next iteration.
-                                del frame_rgb
-                                del frame
-                                gc.collect()
-
-                                progress.progress(min(frame_idx / total_frames, 1.0))
-                                time.sleep(0.02)
-
+                        for frame_rgb in frame_iter:
+                            frame_idx += 1
                             if processed_count >= MAX_FRAMES_PER_VIDEO:
-                                stats_placeholder.info(
-                                    f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames to keep "
-                                    f"memory use safe on this server — analytics below reflect "
-                                    f"everything processed so far."
-                                )
+                                break
+                            if frame_idx % sample_every != 0:
+                                continue
 
-                            cap.release()
+                            # imageio gives RGB; YOLO/OpenCV drawing uses BGR.
+                            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                            frame_bgr = downscale_if_large(frame_bgr)
+
+                            annotated, label, confidence, pose_found = pose_based_fall_detection(
+                                frame_bgr, pose_model
+                            )
+                            record_prediction(label, confidence)
+                            processed_count += 1
+
+                            frame_placeholder.image(
+                                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                                caption=f"Frame {frame_idx} — YOLO pose screening: "
+                                        f"{label.capitalize()} ({confidence:.1%})",
+                                width="stretch",
+                            )
+
+                            with alert_placeholder.container():
+                                if label == FALL_CLASS:
+                                    show_fall_alert(
+                                        confidence, alert_threshold, resident_name,
+                                        caregiver_name, caregiver_contact, room
+                                    )
+                                elif not pose_found:
+                                    st.warning("No clear person detected in this sampled frame.")
+                                else:
+                                    st.info("Monitoring... YOLO pose does not indicate a fall.")
+
+                            if nframes > 0:
+                                progress.progress(min(frame_idx / nframes, 1.0))
+                            else:
+                                progress.progress(min(processed_count / MAX_FRAMES_PER_VIDEO, 1.0))
+
+                            del frame_rgb, frame_bgr, annotated
                             gc.collect()
-                            st.success(f"Video processing complete — {processed_count} frame(s) analyzed.")
+                            time.sleep(0.02)
+
+                        if processed_count == 0:
+                            st.warning("No frames were sampled. Try lowering the frame-skip value.")
+                        elif processed_count >= MAX_FRAMES_PER_VIDEO:
+                            stats_placeholder.info(
+                                f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames to keep "
+                                "server memory use stable. Analytics below reflect the frames analysed."
+                            )
+
+                        st.success(f"Video processing complete — {processed_count} frame(s) analysed with YOLO.")
 
                     except Exception as e:
                         st.error(
                             f"Something went wrong processing this video: {e}. "
-                            f"If this keeps happening with this specific file, try "
-                            f"re-exporting it as a standard H.264 .mp4."
+                            "Try a standard H.264 MP4 file if this specific clip still fails."
                         )
                     finally:
-                        cleanup_temp_files(temp_path, safe_path)
+                        cleanup_temp_files(temp_path)
 
 # ----------------------------------------------------------------------
 # TAB 2: ANALYTICS
