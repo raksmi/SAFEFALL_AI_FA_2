@@ -150,7 +150,7 @@ DEFAULT_ALERT_THRESHOLD = 0.60
 
 # --- Resource limits (see stability note 5 above) ---
 VIDEO_FRAME_SKIP = 15          # only sample every Nth frame
-MAX_FRAMES_PER_VIDEO = 60      # hard cap regardless of video length
+MAX_FRAMES_PER_VIDEO = 20      # safer hard cap for Streamlit Cloud memory
 MAX_FRAME_DIMENSION = 640      # downscale any frame larger than this
 POSE_INFERENCE_SIZE = 480      # YOLO internal inference resolution
 MAX_VIDEO_MB = 150             # reject uploads larger than this outright
@@ -643,47 +643,69 @@ with tab_monitor:
                             frame_idx = 0
                             processed_count = 0
 
-                            while cap.isOpened():
+                            # Process only a small number of sampled frames. This keeps
+                            # TensorFlow + PyTorch/YOLO memory usage manageable on Streamlit Cloud.
+                            while cap.isOpened() and processed_count < MAX_FRAMES_PER_VIDEO:
                                 ret, frame = cap.read()
                                 if not ret:
                                     break
+
                                 frame_idx += 1
 
-                                if frame_idx % sample_every == 0:
-                                    if processed_count >= MAX_FRAMES_PER_VIDEO:
-                                        stats_placeholder.info(
-                                            f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled "
-                                            f"frames to keep memory use safe on this server — "
-                                            f"analytics below reflect everything processed so far."
+                                # Skip frames without sending them to either ML model.
+                                if frame_idx % sample_every != 0:
+                                    del frame
+                                    progress.progress(min(frame_idx / total_frames, 1.0))
+                                    continue
+
+                                # Resize before inference to reduce peak memory.
+                                frame = downscale_if_large(frame)
+
+                                # Run both models on the sampled frame.
+                                annotated, pose_found = run_pose_estimation(frame, pose_model)
+                                label, confidence = classify_frame(frame, classifier)
+                                record_prediction(label, confidence)
+                                processed_count += 1
+
+                                # Convert once and explicitly keep/release the display buffer.
+                                frame_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                                frame_placeholder.image(
+                                    frame_rgb,
+                                    caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
+                                    width="stretch",
+                                )
+
+                                with alert_placeholder.container():
+                                    if label == FALL_CLASS:
+                                        show_fall_alert(
+                                            confidence,
+                                            alert_threshold,
+                                            resident_name,
+                                            caregiver_name,
+                                            caregiver_contact,
+                                            room,
                                         )
-                                        break
+                                    else:
+                                        st.info(
+                                            f"Monitoring... current activity: "
+                                            f"{label.capitalize()}"
+                                        )
 
-                                    frame = downscale_if_large(frame)
-                                    annotated, pose_found = run_pose_estimation(frame, pose_model)
-                                    label, confidence = classify_frame(frame, classifier)
-                                    record_prediction(label, confidence)
-                                    processed_count += 1
-
-                                    frame_placeholder.image(
-                                        cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                                        caption=f"Frame {frame_idx} — {label.capitalize()} ({confidence:.1%})",
-                                        width='stretch',
-                                    )
-                                    with alert_placeholder.container():
-                                        if label == FALL_CLASS:
-                                            show_fall_alert(confidence, alert_threshold, resident_name,
-                                                             caregiver_name, caregiver_contact, room)
-                                        else:
-                                            st.info(f"Monitoring... current activity: {label.capitalize()}")
-
-                                    # Stability note 5: free large per-frame arrays promptly.
-                                    del annotated
-                                    if processed_count % 10 == 0:
-                                        gc.collect()
-
+                                # Release all large arrays before processing the next frame.
+                                del frame_rgb
+                                del annotated
                                 del frame
+                                gc.collect()
+
                                 progress.progress(min(frame_idx / total_frames, 1.0))
                                 time.sleep(0.02)
+
+                            if processed_count >= MAX_FRAMES_PER_VIDEO:
+                                stats_placeholder.info(
+                                    f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames to keep "
+                                    f"memory use safe on this server — analytics below reflect "
+                                    f"everything processed so far."
+                                )
 
                             cap.release()
                             gc.collect()
