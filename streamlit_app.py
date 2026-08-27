@@ -149,13 +149,13 @@ POSE_INFERENCE_SIZE = 480      # YOLO internal inference resolution
 MAX_VIDEO_MB = 150             # reject uploads larger than this outright
 
 ACTIVITY_COLORS = {
-    "fall":     "#e63946",
-    "walking":  "#4895ef",
-    "sitting":  "#9d4edd",
-    "standing": "#f4a261",
-    "normal":   "#2a9d8f",
+    "fall":     "#ef476f",
+    "walking":  "#4cc9f0",
+    "sitting":  "#9b5de5",
+    "standing": "#ffd166",
+    "normal":   "#06d6a0",
 }
-DEFAULT_COLOR = "#888888"
+DEFAULT_COLOR = "#8d99ae"
 
 
 def color_for(activity: str) -> str:
@@ -184,51 +184,147 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @keyframes flash-red {
-        0%   { background-color: #7a0000; }
-        50%  { background-color: #d10000; }
-        100% { background-color: #7a0000; }
+    :root {
+        --sf-navy: #071a2f;
+        --sf-blue: #0b2a4a;
+        --sf-teal: #06d6a0;
+        --sf-cyan: #4cc9f0;
+        --sf-muted: #9fb3c8;
+        --sf-red: #ef476f;
     }
-    .emergency-banner {
-        animation: flash-red 1s infinite;
-        color: white; padding: 22px; border-radius: 10px; text-align: center;
-        font-size: 1.4rem; font-weight: 700; margin-bottom: 14px;
-        border: 2px solid #ffffff40;
+
+    .stApp {
+        background:
+            radial-gradient(circle at top right, rgba(76, 201, 240, 0.10), transparent 28%),
+            linear-gradient(180deg, #061525 0%, #081d33 100%);
     }
-    .notify-card {
-        background: linear-gradient(135deg, #241010, #1a0d0d);
-        border-left: 5px solid #e63946; padding: 14px 18px; border-radius: 6px;
-        margin-top: 10px;
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #061525 0%, #0a2742 100%);
+        border-right: 1px solid rgba(76, 201, 240, 0.16);
     }
+
+    section[data-testid="stSidebar"] * {
+        color: #eaf6ff;
+    }
+
+    .hero {
+        background: linear-gradient(120deg, #0b2742 0%, #0f3a5d 58%, #0a2947 100%);
+        border-radius: 18px;
+        padding: 26px 30px;
+        margin-bottom: 20px;
+        border: 1px solid rgba(76, 201, 240, 0.35);
+        box-shadow: 0 12px 35px rgba(0, 0, 0, 0.22);
+    }
+
+    .hero h1 {
+        margin: 0;
+        font-size: 2.1rem;
+        background: linear-gradient(90deg, #ffffff, #4cc9f0, #06d6a0);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+
+    .status-chip {
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 0.85rem;
+        margin-top: 8px;
+    }
+
     .metric-card {
-        border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; color: white;
+        border-radius: 14px;
+        padding: 15px 17px;
+        margin-bottom: 10px;
+        background: rgba(255,255,255,0.04);
+        box-shadow: 0 6px 18px rgba(0,0,0,0.12);
     }
-    .metric-card .label { font-size: 0.8rem; opacity: 0.85; }
-    .metric-card .value { font-size: 1.6rem; font-weight: 700; }
+    .metric-card .label { font-size: 0.82rem; opacity: 0.82; }
+    .metric-card .value { font-size: 1.65rem; font-weight: 700; }
+
     .summary-card {
-        background: linear-gradient(135deg, #10231f, #0d1a17);
-        border-left: 5px solid #2a9d8f; padding: 16px 20px; border-radius: 8px;
+        background: linear-gradient(135deg, rgba(6,214,160,0.12), rgba(76,201,240,0.07));
+        border-left: 5px solid #06d6a0;
+        padding: 16px 20px;
+        border-radius: 10px;
         line-height: 1.7;
     }
-    .hero {
-        background: linear-gradient(120deg, #101820 0%, #16232e 60%, #101820 100%);
-        border-radius: 14px; padding: 22px 28px; margin-bottom: 18px;
-        border: 1px solid #2a3a47;
+
+    .verdict-card {
+        border-radius: 18px;
+        padding: 24px;
+        text-align: center;
+        margin: 14px 0;
+        border: 1px solid;
     }
-    .hero h1 {
-        margin: 0; font-size: 2rem;
-        background: linear-gradient(90deg, #e63946, #4895ef, #2a9d8f);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+
+    .verdict-fall {
+        background: linear-gradient(135deg, rgba(239,71,111,0.20), rgba(127,22,55,0.22));
+        border-color: #ef476f;
     }
-    .status-chip {
-        display: inline-block; padding: 5px 14px; border-radius: 20px;
-        font-weight: 700; font-size: 0.85rem; margin-top: 8px;
+
+    .verdict-safe {
+        background: linear-gradient(135deg, rgba(6,214,160,0.16), rgba(10,86,97,0.20));
+        border-color: #06d6a0;
+    }
+
+    .verdict-title {
+        font-size: 1.65rem;
+        font-weight: 800;
+        margin-bottom: 6px;
+    }
+
+    .emergency-banner {
+        animation: flash-red 1s infinite;
+        color: white;
+        padding: 22px;
+        border-radius: 12px;
+        text-align: center;
+        font-size: 1.4rem;
+        font-weight: 700;
+        margin-bottom: 14px;
+        border: 2px solid #ffffff40;
+    }
+
+    @keyframes flash-red {
+        0% { background-color: #8a1731; }
+        50% { background-color: #ef476f; }
+        100% { background-color: #8a1731; }
+    }
+
+    .notify-card {
+        background: linear-gradient(135deg, #24111a, #151a2d);
+        border-left: 5px solid #ef476f;
+        padding: 14px 18px;
+        border-radius: 8px;
+        margin-top: 10px;
+    }
+
+    div.stButton > button {
+        border-radius: 10px;
+        border: 1px solid rgba(76,201,240,0.45);
+        font-weight: 700;
+    }
+
+    button[kind="primary"] {
+        background: linear-gradient(90deg, #0b9ec4, #06b88d) !important;
+        color: white !important;
+        border: none !important;
+    }
+
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 10px 10px 0 0;
+        padding: 8px 14px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 
 def metric_card(label, value, color):
     st.markdown(
@@ -525,7 +621,7 @@ recent_fall = (
     and (datetime.now() - st.session_state.last_fall_time).total_seconds() < 30
 )
 status_text = "🚨 ALERT ACTIVE" if recent_fall else "🟢 MONITORING"
-status_color = "#e63946" if recent_fall else "#2a9d8f"
+status_color = "#ef476f" if recent_fall else "#06d6a0"
 
 st.markdown(
     f"""
@@ -641,27 +737,15 @@ with tab_monitor:
                         tfile.close()
                         temp_path = tfile.name
 
-                        frame_placeholder = st.empty()
-                        alert_placeholder = st.empty()
+                        verdict_placeholder = st.empty()
                         progress = st.progress(0)
-                        stats_placeholder = st.empty()
+                        status_placeholder = st.empty()
 
                         # imageio-ffmpeg decodes through an isolated FFmpeg process rather
                         # than OpenCV VideoCapture, while YOLO still handles pose detection.
                         metadata = iio.immeta(temp_path, plugin="FFMPEG")
 
-                        # Some FFmpeg/imageio video files report an unknown frame
-                        # count as infinity. Never convert infinity to int.
-                        raw_fps = metadata.get("fps", 0)
                         raw_nframes = metadata.get("nframes", 0)
-
-                        try:
-                            fps = float(raw_fps)
-                            if not math.isfinite(fps) or fps <= 0:
-                                fps = 30.0
-                        except (TypeError, ValueError, OverflowError):
-                            fps = 30.0
-
                         try:
                             nframes_float = float(raw_nframes)
                             nframes = (
@@ -674,61 +758,112 @@ with tab_monitor:
 
                         frame_idx = 0
                         processed_count = 0
+                        fall_detected = False
+                        best_fall_confidence = 0.0
+                        best_fall_frame = None
+
+                        # Analyse sampled frames quietly. We only display a frame
+                        # at the end if YOLO identifies the strongest likely fall.
                         frame_iter = iio.imiter(temp_path, plugin="FFMPEG")
+                        status_placeholder.info("🔍 Analysing the video for a possible fall...")
 
                         for frame_rgb in frame_iter:
                             frame_idx += 1
+
                             if processed_count >= MAX_FRAMES_PER_VIDEO:
                                 break
+
                             if frame_idx % sample_every != 0:
                                 continue
 
-                            # imageio gives RGB; YOLO/OpenCV drawing uses BGR.
                             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                             frame_bgr = downscale_if_large(frame_bgr)
 
                             annotated, label, confidence, pose_found = pose_based_fall_detection(
                                 frame_bgr, pose_model
                             )
-                            record_prediction(label, confidence)
                             processed_count += 1
 
-                            frame_placeholder.image(
-                                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                                caption=f"Frame {frame_idx} — YOLO pose screening: "
-                                        f"{label.capitalize()} ({confidence:.1%})",
-                                width="stretch",
-                            )
-
-                            with alert_placeholder.container():
-                                if label == FALL_CLASS:
-                                    show_fall_alert(
-                                        confidence, alert_threshold, resident_name,
-                                        caregiver_name, caregiver_contact, room
-                                    )
-                                elif not pose_found:
-                                    st.warning("No clear person detected in this sampled frame.")
-                                else:
-                                    st.info("Monitoring... YOLO pose does not indicate a fall.")
+                            # Keep only the strongest fall frame. Normal frames
+                            # are never displayed.
+                            if label == FALL_CLASS and confidence > best_fall_confidence:
+                                fall_detected = True
+                                best_fall_confidence = confidence
+                                best_fall_frame = annotated.copy()
 
                             if nframes > 0:
                                 progress.progress(min(frame_idx / nframes, 1.0))
                             else:
-                                progress.progress(min(processed_count / MAX_FRAMES_PER_VIDEO, 1.0))
+                                progress.progress(
+                                    min(processed_count / MAX_FRAMES_PER_VIDEO, 1.0)
+                                )
 
                             del frame_rgb, frame_bgr, annotated
                             gc.collect()
-                            time.sleep(0.02)
+
+                        progress.empty()
+                        status_placeholder.empty()
 
                         if processed_count == 0:
-                            st.warning("No frames were sampled. Try lowering the frame-skip value.")
-                        elif processed_count >= MAX_FRAMES_PER_VIDEO:
-                            stats_placeholder.info(
-                                f"Stopped after {MAX_FRAMES_PER_VIDEO} sampled frames to keep "
-                                "server memory use stable. Analytics below reflect the frames analysed."
+                            st.warning("No frames were analysed. Try lowering the frame-skip value.")
+                        elif fall_detected:
+                            # Record ONE final video result, rather than filling
+                            # analytics with every individual sampled frame.
+                            record_prediction(FALL_CLASS, best_fall_confidence)
+
+                            verdict_placeholder.markdown(
+                                f"""
+                                <div class="verdict-card verdict-fall">
+                                    <div class="verdict-title">🚨 FALL DETECTED</div>
+                                    <div>YOLO identified a likely fall in the analysed video.</div>
+                                    <div style="margin-top:8px;opacity:0.85;">
+                                        Detection confidence: <b>{best_fall_confidence:.1%}</b>
+                                    </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
                             )
 
-                        st.success(f"Video processing complete — {processed_count} frame(s) analysed with YOLO.")
+                            show_fall_alert(
+                                best_fall_confidence,
+                                alert_threshold,
+                                resident_name,
+                                caregiver_name,
+                                caregiver_contact,
+                                room,
+                            )
+
+                            st.image(
+                                cv2.cvtColor(best_fall_frame, cv2.COLOR_BGR2RGB),
+                                caption="Strongest detected fall frame — YOLOv8 Pose",
+                                width="stretch",
+                            )
+                            del best_fall_frame
+                        else:
+                            # Record one overall result for the entire video.
+                            record_prediction("normal", 1.0)
+
+                            verdict_placeholder.markdown(
+                                f"""
+                                <div class="verdict-card verdict-safe">
+                                    <div class="verdict-title">✅ NO FALL DETECTED</div>
+                                    <div>
+                                        No sampled frame met the YOLO fall-detection criteria.
+                                    </div>
+                                    <div style="margin-top:8px;opacity:0.80;">
+                                        {processed_count} frame(s) analysed.
+                                    </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+
+                        if processed_count >= MAX_FRAMES_PER_VIDEO:
+                            st.caption(
+                                f"Analysed {MAX_FRAMES_PER_VIDEO} sampled frames for stable cloud performance."
+                            )
+                        else:
+                            st.caption(f"Analysed {processed_count} sampled frame(s).")
 
                     except Exception as e:
                         st.error(
